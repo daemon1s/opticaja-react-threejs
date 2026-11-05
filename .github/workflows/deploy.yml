@@ -1,62 +1,64 @@
-name: Compilación y despliegue de OptiCaja
+name: Deploy
+
+# Deploy simple al VPS Oracle (ARM64): el build se hace en el VPS.
+# Si el healthcheck falla, vuelve al commit anterior automaticamente.
+# Por ahora solo manual. Para deploy en cada push, agregar:
+#   push:
+#     branches: [main]
+on:
+  workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: deploy-opticaja
+  cancel-in-progress: false
 
-on:
-  push:
-    branches: [ main ]
-    paths:
-      - 'src/**'
-      - 'public/**'
-      - 'index.html'
-      - 'package*.json'
-      - 'vite.config.js'
-      - 'docker-compose.yml'
-      - 'Dockerfile'
-      - 'nginx.conf'
-      - '.github/workflows/**'
-  workflow_dispatch: 
+permissions:
+  contents: read
+
+env:
+  APP_DIR: /home/ubuntu/apps/opticaja-react-threejs
+  COMPOSE_FILE: docker-compose.deploy.yml
+  HEALTH_URLS: "http://127.0.0.1:3205/"
 
 jobs:
-  compilar-y-subir:
+  deploy:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
+    timeout-minutes: 25
     steps:
-      - name: Descargar código
-        uses: actions/checkout@v4
-
-      - name: Iniciar sesión en GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Construir y subir imagen Docker
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: ghcr.io/${{ github.repository_owner }}/opticaja:latest
-
-  desplegar:
-    needs: compilar-y-subir
-    runs-on: ubuntu-latest
-    steps:
-      - name: Desplegar en VPS vía SSH
+      - name: Deploy con rollback
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.HOST }}
-          username: root
+          username: ubuntu
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: APP_DIR,COMPOSE_FILE,HEALTH_URLS
           script: |
-            cd /root/opticaja
-            git fetch --all
+            set -u
+            cd "$APP_DIR"
+
+            healthy() {
+              for i in $(seq 1 30); do
+                ok=1
+                for u in $HEALTH_URLS; do curl -fs -o /dev/null "$u" || ok=0; done
+                [ "$ok" = 1 ] && return 0
+                sleep 2
+              done
+              return 1
+            }
+
+            prev=$(git rev-parse HEAD)
+            git fetch origin main
             git reset --hard origin/main
-            docker compose pull
-            docker compose up -d --wait
-            docker image prune -f
+            echo "deploy: $prev -> $(git rev-parse HEAD)"
+
+            if docker compose -f "$COMPOSE_FILE" up -d --build && healthy; then
+              docker image prune -f
+              echo "OK"
+              exit 0
+            fi
+
+            echo "FALLO. Rollback a $prev"
+            git reset --hard "$prev"
+            docker compose -f "$COMPOSE_FILE" up -d --build
+            healthy && echo "rollback OK" || echo "rollback tambien fallo, revisar a mano"
+            exit 1
