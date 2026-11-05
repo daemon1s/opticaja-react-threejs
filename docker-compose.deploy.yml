@@ -1,0 +1,8 @@
+services:
+  opticaja:
+    build: .
+    image: opticaja:local
+    container_name: opticaja
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3205:80"
